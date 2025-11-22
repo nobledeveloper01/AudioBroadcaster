@@ -40,18 +40,34 @@
   // WebSocket
   let ws = null;
 
-  function createMediaSource() {
-    // Clean up existing
-    if (mediaSource) {
-      try {
-        if (mediaSource.readyState === 'open') {
-          mediaSource.endOfStream();
-        }
-      } catch (e) {}
-    }
-    
+  // ---------------- Helpers ----------------
+  function isSourceBufferValid() {
+    return sourceBuffer && mediaSource && mediaSource.readyState === 'open' && mediaSource.sourceBuffers.includes(sourceBuffer);
+  }
+
+  function resetMediaSource() {
     queue = [];
     isAppending = false;
+
+    if (sourceBuffer && mediaSource) {
+      try {
+        if (mediaSource.sourceBuffers.includes(sourceBuffer)) {
+          mediaSource.removeSourceBuffer(sourceBuffer);
+        }
+      } catch (e) {}
+      sourceBuffer = null;
+    }
+
+    if (mediaSource) {
+      try {
+        mediaSource.endOfStream();
+      } catch (e) {}
+      mediaSource = null;
+    }
+  }
+
+  function createMediaSource() {
+    resetMediaSource();
     
     mediaSource = new MediaSource();
     player.src = URL.createObjectURL(mediaSource);
@@ -61,7 +77,7 @@
         try {
           sourceBuffer = mediaSource.addSourceBuffer('audio/webm;codecs=opus');
           sourceBuffer.mode = 'sequence';
-          
+
           sourceBuffer.addEventListener('updateend', () => {
             isAppending = false;
             processQueue();
@@ -71,7 +87,7 @@
           sourceBuffer.addEventListener('error', (e) => {
             console.error('SourceBuffer error:', e);
           });
-          
+
           resolve();
         } catch (e) {
           console.error('Failed to create SourceBuffer:', e);
@@ -87,10 +103,7 @@
   }
 
   function isSourceBufferReady() {
-    return sourceBuffer && 
-           mediaSource && 
-           mediaSource.readyState === 'open' && 
-           !sourceBuffer.updating;
+    return isSourceBufferValid() && !sourceBuffer.updating;
   }
 
   function processQueue() {
@@ -99,13 +112,13 @@
 
     isAppending = true;
     const chunk = queue.shift();
-    
+
     try {
       sourceBuffer.appendBuffer(chunk);
     } catch (e) {
       console.error('Error appending buffer:', e);
       isAppending = false;
-      
+
       if (e.name === 'QuotaExceededError') {
         tryTrimBuffer();
         queue.unshift(chunk); // Put it back
@@ -114,10 +127,8 @@
   }
 
   function appendChunk(data) {
-    // Don't queue if MediaSource isn't ready
-    if (!mediaSource || mediaSource.readyState !== 'open') {
-      return;
-    }
+    if (!isSourceBufferValid() || mediaSource.readyState !== 'open') return;
+
     queue.push(data);
     processQueue();
   }
@@ -125,38 +136,38 @@
   function tryTrimBuffer() {
     if (!isSourceBufferReady()) return;
     if (!sourceBuffer.buffered.length) return;
-    
+
     const currentTime = player.currentTime;
     const start = sourceBuffer.buffered.start(0);
     const end = sourceBuffer.buffered.end(0);
-    
+
     // Keep only ~3 seconds behind
     if (currentTime - start > 3) {
       try {
         sourceBuffer.remove(start, currentTime - 1);
       } catch (e) {}
     }
-    
+
     // Skip ahead if too far behind
     if (end - currentTime > 1.5 && isPlaying) {
       player.currentTime = end - 0.2;
     }
   }
 
-  // Audio level meter
+  // ---------------- Audio Analyzer ----------------
   function initAudioAnalyser() {
     if (audioContext) return;
-    
+
     try {
       audioContext = new (window.AudioContext || window.webkitAudioContext)();
       analyser = audioContext.createAnalyser();
       analyser.fftSize = 256;
       analyser.smoothingTimeConstant = 0.8;
-      
+
       sourceNode = audioContext.createMediaElementSource(player);
       sourceNode.connect(analyser);
       analyser.connect(audioContext.destination);
-      
+
       if (levelContainer) levelContainer.classList.remove('hidden');
       updateLevelMeter();
     } catch (e) {
@@ -166,15 +177,15 @@
 
   function updateLevelMeter() {
     if (!analyser || !levelBar) return;
-    
+
     const dataArray = new Uint8Array(analyser.frequencyBinCount);
     analyser.getByteFrequencyData(dataArray);
-    
+
     const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
     const level = Math.min(100, (avg / 255) * 100 * 1.5);
-    
+
     levelBar.style.width = `${level}%`;
-    
+
     if (level > 80) {
       levelBar.className = 'h-full bg-red-500 rounded transition-all duration-75';
     } else if (level > 50) {
@@ -182,7 +193,7 @@
     } else {
       levelBar.className = 'h-full bg-green-500 rounded transition-all duration-75';
     }
-    
+
     animationId = requestAnimationFrame(updateLevelMeter);
   }
 
@@ -194,12 +205,11 @@
     if (levelBar) levelBar.style.width = '0%';
   }
 
-  // Start playback (called after user interaction)
+  // ---------------- Playback ----------------
   async function startPlayback() {
-    if (!sourceBuffer?.buffered.length) return;
-    
+    if (!isSourceBufferValid() || sourceBuffer.buffered.length === 0) return;
+
     try {
-      // Jump to live edge
       player.currentTime = sourceBuffer.buffered.end(0) - 0.1;
       await player.play();
       isPlaying = true;
@@ -213,11 +223,26 @@
     }
   }
 
-  // WebSocket connection
+  function onUserInteraction() {
+    userHasInteracted = true;
+
+    if (audioContext?.state === 'suspended') {
+      audioContext.resume();
+    }
+
+    if (isSourceBufferValid() && sourceBuffer.buffered.length) {
+      startPlayback();
+    } else {
+      statusEl.textContent = 'Waiting for audio data...';
+      messageEl.textContent = '';
+    }
+  }
+
+  // ---------------- WebSocket ----------------
   async function connect() {
     queue = [];
     isAppending = false;
-    
+
     try {
       await createMediaSource();
     } catch (e) {
@@ -252,9 +277,9 @@
     ws.onclose = () => {
       stopLevelMeter();
       isPlaying = false;
-      
+
       if (intentionallyClosed) return;
-      
+
       if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
         reconnectAttempts++;
         statusEl.textContent = `Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`;
@@ -277,21 +302,21 @@
         statusEl.textContent = 'Broadcast ended';
         messageEl.textContent = 'The broadcaster has stopped the stream.';
         if (listenBtn) listenBtn.classList.add('hidden');
-        if (mediaSource?.readyState === 'open') {
+        if (isSourceBufferValid()) {
           try { mediaSource.endOfStream(); } catch (e) {}
         }
         stopLevelMeter();
         ws.close();
         break;
-        
+
       case 'broadcast-started':
         statusEl.textContent = userHasInteracted ? 'Live — buffering...' : 'Live — click to listen';
         break;
-        
+
       case 'ok':
         console.log('Connected to session:', msg.sessionId);
         break;
-        
+
       case 'init-segment':
         console.log('Receiving init segment:', msg.size, 'bytes');
         break;
@@ -300,34 +325,14 @@
 
   function handleBinaryData(data) {
     appendChunk(data);
-    
-    // Auto-play if user has already interacted
-    if (userHasInteracted && !isPlaying && sourceBuffer?.buffered.length) {
+
+    if (userHasInteracted && !isPlaying && isSourceBufferValid() && sourceBuffer.buffered.length) {
       startPlayback();
     }
   }
 
-  // User interaction handler
-  function onUserInteraction() {
-    userHasInteracted = true;
-    
-    // Resume audio context if suspended
-    if (audioContext?.state === 'suspended') {
-      audioContext.resume();
-    }
-    
-    if (sourceBuffer?.buffered.length) {
-      startPlayback();
-    } else {
-      statusEl.textContent = 'Waiting for audio data...';
-      messageEl.textContent = '';
-    }
-  }
-
-  // Event listeners
-  if (listenBtn) {
-    listenBtn.addEventListener('click', onUserInteraction);
-  }
+  // ---------------- Event Listeners ----------------
+  if (listenBtn) listenBtn.addEventListener('click', onUserInteraction);
 
   player.addEventListener('play', () => {
     userHasInteracted = true;
@@ -336,7 +341,7 @@
     messageEl.textContent = '';
     if (listenBtn) listenBtn.classList.add('hidden');
     initAudioAnalyser();
-    
+
     if (audioContext?.state === 'suspended') {
       audioContext.resume();
     }
@@ -354,6 +359,6 @@
     stopLevelMeter();
   });
 
-  // Start connection immediately
+  // Start connection
   connect();
 })();
