@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Live Audio — Broadcaster</title>
+  <link rel="stylesheet" href="styles.css">
+  <link href="/tailwind.css" rel="stylesheet">
+  <link rel="icon" href="data:," />
+</head>
+<body class="bg-gradient-to-br from-indigo-900 via-slate-900 to-gray-800 min-h-screen text-gray-100">
+  <div class="container mx-auto p-6">
+    <div class="max-w-5xl mx-auto glass p-6 rounded-2xl shadow-xl">
+      <div class="flex items-center justify-between">
+        <div>
+          <h1 class="text-3xl font-semibold">Start Live Audio</h1>
+          <p class="text-sm opacity-80 mt-1">Share a temporary link — listeners can join until you stop the broadcast.</p>
+        </div>
+        <div class="text-right">
+          <span id="statusBadge" class="px-3 py-1 rounded-full bg-green-600 text-sm hidden">Live</span>
+          <span id="statusOffline" class="px-3 py-1 rounded-full bg-gray-600 text-sm">Offline</span>
+        </div>
+      </div>
+
+      <div class="mt-6 grid gap-4">
+        <div class="flex gap-3 items-center">
+          <button id="startBtn" class="btn-primary px-5 py-3 rounded-full text-white font-medium">Start Live Audio</button>
+          <button id="stopBtn" class="btn-danger px-4 py-3 rounded-full text-white font-medium hidden">Stop Broadcast</button>
+          <div id="timer" class="ml-4 text-lg font-mono opacity-80">00:00</div>
+        </div>
+
+        <!-- Audio Level Meter -->
+        <div id="levelContainer" class="hidden p-4 rounded-xl bg-white/5 border border-white/5">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-sm opacity-80">Microphone Level</span>
+            <span class="text-xs opacity-60">Speak to test</span>
+          </div>
+          <div class="h-4 bg-black/30 rounded overflow-hidden">
+            <div id="levelBar" class="h-full bg-green-500 rounded transition-all duration-75" style="width: 0%"></div>
+          </div>
+        </div>
+
+        <div id="linkPanel" class="p-4 rounded-xl bg-white/5 border border-white/5 hidden">
+          <div class="flex items-center justify-between">
+            <div class="flex-1 min-w-0">
+              <div class="text-xs opacity-80 mb-1">Shareable Link (temporary)</div>
+              <div id="link" class="font-mono text-sm truncate"></div>
+            </div>
+            <div class="flex gap-2 ml-4">
+              <button id="copyBtn" class="px-3 py-1 rounded-md bg-white/10 hover:bg-white/20 transition">Copy</button>
+              <a id="openListen" class="px-3 py-1 rounded-md bg-white/10 hover:bg-white/20 transition text-sm flex items-center" target="_blank">Open</a>
+            </div>
+          </div>
+          
+          <!-- Listener count -->
+          <div class="mt-3 pt-3 border-t border-white/10 flex items-center gap-2 text-sm">
+            <svg class="w-4 h-4 opacity-60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"></path>
+            </svg>
+            <span class="opacity-60">Listeners:</span>
+            <span id="listenerCount" class="font-medium">0</span>
+          </div>
+        </div>
+
+        <div class="p-4 rounded-xl bg-white/5 border border-white/5">
+          <h3 class="text-sm opacity-80 mb-2">Recording</h3>
+          <div class="flex gap-3 items-center">
+            <button id="downloadBtn" class="px-4 py-2 rounded-md bg-white/10 hover:bg-white/20 transition disabled:opacity-50 disabled:cursor-not-allowed" disabled>Download Recording</button>
+            <div id="recordHint" class="text-sm opacity-70">Recording will be saved server-side and available after you stop.</div>
+          </div>
+        </div>
+
+        <div class="text-xs opacity-60 mt-2 space-y-1">
+          <p>💡 Tip: Allow microphone access. For low-latency with large audiences, consider a dedicated media server.</p>
+          <p>⚠️ Closing this page will end the broadcast.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/broadcaster.js"></script>
+</body>
+</html>
