@@ -18,7 +18,6 @@
   const MAX_RECONNECT_ATTEMPTS = 5;
   const RECONNECT_DELAY_MS = 2000;
   let reconnectAttempts = 0;
-  let reconnectTimeout = null;
   let intentionallyClosed = false;
   let userHasInteracted = false;
   let isPlaying = false;
@@ -33,97 +32,124 @@
   let animationId = null;
   let ws = null;
 
-  // FIXED: Safe SourceBuffer check (works in all browsers)
+  // SUPER SAFE: Check if sourceBuffer is still attached and alive
   function isSourceBufferValid() {
-    if (!sourceBuffer || !mediaSource || mediaSource.readyState !== 'open') return false;
-    for (let i = 0; i < mediaSource.sourceBuffers.length; i++) {
-      if (mediaSource.sourceBuffers[i] === sourceBuffer) return true;
-    }
-    return false;
+    return (
+      sourceBuffer &&
+      mediaSource &&
+      mediaSource.readyState === 'open' &&
+      mediaSource.sourceBuffers &&
+      Array.from(mediaSource.sourceBuffers).includes(sourceBuffer)
+    );
   }
 
   function resetMediaSource() {
     queue = [];
     isAppending = false;
 
-    if (sourceBuffer && mediaSource) {
-      for (let i = 0; i < mediaSource.sourceBuffers.length; i++) {
-        if (mediaSource.sourceBuffers[i] === sourceBuffer) {
-          try { mediaSource.removeSourceBuffer(sourceBuffer); } catch (e) {}
-          break;
-        }
-      }
-      sourceBuffer = null;
+    if (sourceBuffer && mediaSource && mediaSource.readyState === 'open') {
+      try {
+        mediaSource.removeSourceBuffer(sourceBuffer);
+      } catch (e) {}
     }
+    sourceBuffer = null;
 
     if (mediaSource) {
       try { mediaSource.endOfStream(); } catch (e) {}
+      if (player.src) URL.revokeObjectURL(player.src);
       mediaSource = null;
     }
+    player.src = '';
   }
 
   async function createMediaSource() {
     resetMediaSource();
+
     mediaSource = new MediaSource();
     player.src = URL.createObjectURL(mediaSource);
 
     return new Promise((resolve, reject) => {
-      mediaSource.addEventListener('sourceopen', () => {
+      const onSourceOpen = () => {
         try {
           sourceBuffer = mediaSource.addSourceBuffer('audio/webm;codecs=opus');
           sourceBuffer.mode = 'sequence';
+
           sourceBuffer.addEventListener('updateend', () => {
             isAppending = false;
             processQueue();
             tryTrimBuffer();
           });
+
+          sourceBuffer.addEventListener('error', (e) => {
+            console.error('SourceBuffer error:', e);
+          });
+
           resolve();
         } catch (e) {
           reject(e);
         }
-      }, { once: true });
+        mediaSource.removeEventListener('sourceopen', onSourceOpen);
+      };
 
+      mediaSource.addEventListener('sourceopen', onSourceOpen);
       mediaSource.addEventListener('error', () => reject(new Error('MediaSource error')));
     });
   }
 
   function processQueue() {
-    if (isAppending || queue.length === 0 || !isSourceBufferValid() || sourceBuffer.updating) return;
+    if (isAppending || queue.length === 0) return;
+    if (!isSourceBufferValid() || sourceBuffer.updating) return;
+
     isAppending = true;
     const chunk = queue.shift();
+
     try {
       sourceBuffer.appendBuffer(chunk);
     } catch (e) {
+      console.error('appendBuffer error:', e);
       isAppending = false;
+
       if (e.name === 'QuotaExceededError') {
         tryTrimBuffer();
         queue.unshift(chunk);
+        setTimeout(processQueue, 100);
       }
     }
   }
 
   function appendChunk(data) {
-    if (!isSourceBufferValid() || mediaSource.readyState !== 'open') return;
+    if (!isSourceBufferValid() || mediaSource.readyState !== 'open') {
+      console.warn('Dropping chunk: SourceBuffer not valid');
+      return;
+    }
     queue.push(data);
     processQueue();
   }
 
   function tryTrimBuffer() {
-    if (!sourceBuffer || sourceBuffer.updating || !sourceBuffer.buffered.length) return;
-    const current = player.currentTime;
-    const start = sourceBuffer.buffered.start(0);
-    const end = sourceBuffer.buffered.end(0);
+    if (!isSourceBufferValid() || sourceBuffer.updating) return;
+    if (!sourceBuffer.buffered || sourceBuffer.buffered.length === 0) return;
 
-    if (current - start > 3) {
-      try { sourceBuffer.remove(start, current - 1); } catch (e) {}
-    }
-    if (end - current > 1.5 && isPlaying) {
-      player.currentTime = end - 0.2;
+    try {
+      const current = player.currentTime;
+      const start = sourceBuffer.buffered.start(0);
+      const end = sourceBuffer.buffered.end(0);
+
+      if (current - start > 3) {
+        sourceBuffer.remove(start, current - 1);
+      }
+
+      if (end - current > 1.5 && isPlaying) {
+        player.currentTime = end - 0.2;
+      }
+    } catch (e) {
+      // This is expected during teardown — silently ignore
+      // console.warn('tryTrimBuffer failed (normal during cleanup):', e);
     }
   }
 
   function initAudioAnalyser() {
-    if (audioContext) return;
+    if (audioContext || !player) return;
     try {
       audioContext = new (window.AudioContext || window.webkitAudioContext)();
       analyser = audioContext.createAnalyser();
@@ -134,11 +160,13 @@
       analyser.connect(audioContext.destination);
       levelContainer.classList.remove('hidden');
       updateLevelMeter();
-    } catch (e) { console.error('Analyser init failed', e); }
+    } catch (e) {
+      console.error('Failed to create analyser:', e);
+    }
   }
 
   function updateLevelMeter() {
-    if (!analyser) return;
+    if (!analyser || !levelBar) return;
     const data = new Uint8Array(analyser.frequencyBinCount);
     analyser.getByteFrequencyData(data);
     const avg = data.reduce((a, b) => a + b, 0) / data.length;
@@ -148,10 +176,19 @@
     animationId = requestAnimationFrame(updateLevelMeter);
   }
 
+  function stopLevelMeter() {
+    if (animationId) cancelAnimationFrame(animationId);
+    animationId = null;
+    if (levelBar) levelBar.style.width = '0%';
+  }
+
   async function startPlayback() {
-    if (!isSourceBufferValid() || !sourceBuffer.buffered.length) return;
+    if (!isSourceBufferValid()) return;
+
     try {
-      player.currentTime = sourceBuffer.buffered.end(0) - 0.1;
+      if (sourceBuffer.buffered.length > 0) {
+        player.currentTime = sourceBuffer.buffered.end(0) - 0.1;
+      }
       await player.play();
       isPlaying = true;
       statusEl.textContent = 'Live — playing';
@@ -159,24 +196,32 @@
       listenBtn?.classList.add('hidden');
       initAudioAnalyser();
     } catch (e) {
-      messageEl.textContent = 'Click to play (autoplay blocked)';
+      messageEl.textContent = 'Click "Start Listening" to play';
     }
   }
 
   function onUserInteraction() {
     userHasInteracted = true;
     audioContext?.resume();
-    if (sourceBuffer?.buffered.length) startPlayback();
+
+    if (isSourceBufferValid() && sourceBuffer.buffered.length > 0) {
+      startPlayback();
+    } else {
+      statusEl.textContent = 'Waiting for audio...';
+    }
   }
 
   async function connect() {
     queue = [];
     isAppending = false;
+    stopLevelMeter();
+
     try {
       await createMediaSource();
+      statusEl.textContent = 'Connected — waiting for audio...';
     } catch (e) {
-      statusEl.textContent = 'Unsupported format';
-      messageEl.textContent = 'Your browser may not support WebM/Opus';
+      statusEl.textContent = 'Browser not supported';
+      messageEl.textContent = 'Try? Your browser may not support WebM/Opus';
       return;
     }
 
@@ -187,7 +232,7 @@
     ws.onopen = () => {
       reconnectAttempts = 0;
       statusEl.textContent = 'Connected — waiting for audio...';
-      messageEl.textContent = userHasInteracted ? '' : 'Click "Start Listening" when ready';
+      messageEl.textContent = 'Click "Start Listening" when ready';
     };
 
     ws.onmessage = (ev) => {
@@ -207,35 +252,49 @@
         } catch (e) {}
         return;
       }
+
+      // CRITICAL: Check validity BEFORE touching sourceBuffer
+      if (!isSourceBufferValid()) {
+        console.warn('Received audio chunk but SourceBuffer is gone — ignoring');
+        return;
+      }
+
       appendChunk(ev.data);
-      if (userHasInteracted && !isPlaying && sourceBuffer?.buffered.length) {
+
+      if (userHasInteracted && !isPlaying && sourceBuffer?.buffered.length > 0) {
         startPlayback();
       }
     };
 
     ws.onclose = () => {
-      if (animationId) cancelAnimationFrame(animationId);
+      stopLevelMeter();
       isPlaying = false;
+
       if (intentionallyClosed) return;
+
       if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
         reconnectAttempts++;
         statusEl.textContent = `Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`;
-        reconnectTimeout = setTimeout(connect, RECONNECT_DELAY_MS);
+        setTimeout(connect, RECONNECT_DELAY_MS);
       } else {
         statusEl.textContent = 'Disconnected';
         messageEl.textContent = 'Refresh to try again.';
       }
     };
+
+    ws.onerror = (e) => console.error('WebSocket error:', e);
   }
 
   listenBtn?.addEventListener('click', onUserInteraction);
+
   player.addEventListener('play', () => {
-    userHasInteracted = true;
     isPlaying = true;
     statusEl.textContent = 'Live — playing';
     listenBtn?.classList.add('hidden');
     initAudioAnalyser();
   });
+
+  player.addEventListener('pause', stopLevelMeter);
 
   window.addEventListener('beforeunload', () => {
     intentionallyClosed = true;
