@@ -2,6 +2,7 @@
   const urlParams = new URLSearchParams(location.search);
   const sid = urlParams.get('sid');
   const token = urlParams.get('t');
+
   const statusEl = document.getElementById('status');
   const messageEl = document.getElementById('message');
   const player = document.getElementById('player');
@@ -15,65 +16,52 @@
     return;
   }
 
+  // State
   const MAX_RECONNECT_ATTEMPTS = 5;
   const RECONNECT_DELAY_MS = 2000;
   let reconnectAttempts = 0;
+  let reconnectTimeout = null;
   let intentionallyClosed = false;
   let userHasInteracted = false;
   let isPlaying = false;
 
+  // MediaSource
   let mediaSource = null;
   let sourceBuffer = null;
   let queue = [];
   let isAppending = false;
 
+  // Audio analysis
   let audioContext = null;
   let analyser = null;
+  let sourceNode = null;
   let animationId = null;
+
+  // WebSocket
   let ws = null;
 
-  // SUPER SAFE: Check if sourceBuffer is still attached and alive
-  function isSourceBufferValid() {
-    return (
-      sourceBuffer &&
-      mediaSource &&
-      mediaSource.readyState === 'open' &&
-      mediaSource.sourceBuffers &&
-      Array.from(mediaSource.sourceBuffers).includes(sourceBuffer)
-    );
-  }
-
-  function resetMediaSource() {
-    queue = [];
-    isAppending = false;
-
-    if (sourceBuffer && mediaSource && mediaSource.readyState === 'open') {
+  function createMediaSource() {
+    // Clean up existing
+    if (mediaSource) {
       try {
-        mediaSource.removeSourceBuffer(sourceBuffer);
+        if (mediaSource.readyState === 'open') {
+          mediaSource.endOfStream();
+        }
       } catch (e) {}
     }
-    sourceBuffer = null;
-
-    if (mediaSource) {
-      try { mediaSource.endOfStream(); } catch (e) {}
-      if (player.src) URL.revokeObjectURL(player.src);
-      mediaSource = null;
-    }
-    player.src = '';
-  }
-
-  async function createMediaSource() {
-    resetMediaSource();
-
+    
+    queue = [];
+    isAppending = false;
+    
     mediaSource = new MediaSource();
     player.src = URL.createObjectURL(mediaSource);
 
     return new Promise((resolve, reject) => {
-      const onSourceOpen = () => {
+      mediaSource.addEventListener('sourceopen', () => {
         try {
           sourceBuffer = mediaSource.addSourceBuffer('audio/webm;codecs=opus');
           sourceBuffer.mode = 'sequence';
-
+          
           sourceBuffer.addEventListener('updateend', () => {
             isAppending = false;
             processQueue();
@@ -83,43 +71,51 @@
           sourceBuffer.addEventListener('error', (e) => {
             console.error('SourceBuffer error:', e);
           });
-
+          
           resolve();
         } catch (e) {
+          console.error('Failed to create SourceBuffer:', e);
           reject(e);
         }
-        mediaSource.removeEventListener('sourceopen', onSourceOpen);
-      };
+      });
 
-      mediaSource.addEventListener('sourceopen', onSourceOpen);
-      mediaSource.addEventListener('error', () => reject(new Error('MediaSource error')));
+      mediaSource.addEventListener('error', (e) => {
+        console.error('MediaSource error:', e);
+        reject(e);
+      });
     });
+  }
+
+  function isSourceBufferReady() {
+    return sourceBuffer && 
+           mediaSource && 
+           mediaSource.readyState === 'open' && 
+           !sourceBuffer.updating;
   }
 
   function processQueue() {
     if (isAppending || queue.length === 0) return;
-    if (!isSourceBufferValid() || sourceBuffer.updating) return;
+    if (!isSourceBufferReady()) return;
 
     isAppending = true;
     const chunk = queue.shift();
-
+    
     try {
       sourceBuffer.appendBuffer(chunk);
     } catch (e) {
-      console.error('appendBuffer error:', e);
+      console.error('Error appending buffer:', e);
       isAppending = false;
-
+      
       if (e.name === 'QuotaExceededError') {
         tryTrimBuffer();
-        queue.unshift(chunk);
-        setTimeout(processQueue, 100);
+        queue.unshift(chunk); // Put it back
       }
     }
   }
 
   function appendChunk(data) {
-    if (!isSourceBufferValid() || mediaSource.readyState !== 'open') {
-      console.warn('Dropping chunk: SourceBuffer not valid');
+    // Don't queue if MediaSource isn't ready
+    if (!mediaSource || mediaSource.readyState !== 'open') {
       return;
     }
     queue.push(data);
@@ -127,179 +123,237 @@
   }
 
   function tryTrimBuffer() {
-    if (!isSourceBufferValid() || sourceBuffer.updating) return;
-    if (!sourceBuffer.buffered || sourceBuffer.buffered.length === 0) return;
-
-    try {
-      const current = player.currentTime;
-      const start = sourceBuffer.buffered.start(0);
-      const end = sourceBuffer.buffered.end(0);
-
-      if (current - start > 3) {
-        sourceBuffer.remove(start, current - 1);
-      }
-
-      if (end - current > 1.5 && isPlaying) {
-        player.currentTime = end - 0.2;
-      }
-    } catch (e) {
-      // This is expected during teardown — silently ignore
-      // console.warn('tryTrimBuffer failed (normal during cleanup):', e);
+    if (!isSourceBufferReady()) return;
+    if (!sourceBuffer.buffered.length) return;
+    
+    const currentTime = player.currentTime;
+    const start = sourceBuffer.buffered.start(0);
+    const end = sourceBuffer.buffered.end(0);
+    
+    // Keep only ~3 seconds behind
+    if (currentTime - start > 3) {
+      try {
+        sourceBuffer.remove(start, currentTime - 1);
+      } catch (e) {}
+    }
+    
+    // Skip ahead if too far behind
+    if (end - currentTime > 1.5 && isPlaying) {
+      player.currentTime = end - 0.2;
     }
   }
 
+  // Audio level meter
   function initAudioAnalyser() {
-    if (audioContext || !player) return;
+    if (audioContext) return;
+    
     try {
       audioContext = new (window.AudioContext || window.webkitAudioContext)();
       analyser = audioContext.createAnalyser();
       analyser.fftSize = 256;
       analyser.smoothingTimeConstant = 0.8;
-      const source = audioContext.createMediaElementSource(player);
-      source.connect(analyser);
+      
+      sourceNode = audioContext.createMediaElementSource(player);
+      sourceNode.connect(analyser);
       analyser.connect(audioContext.destination);
-      levelContainer.classList.remove('hidden');
+      
+      if (levelContainer) levelContainer.classList.remove('hidden');
       updateLevelMeter();
     } catch (e) {
-      console.error('Failed to create analyser:', e);
+      console.error('Failed to init audio analyser:', e);
     }
   }
 
   function updateLevelMeter() {
     if (!analyser || !levelBar) return;
-    const data = new Uint8Array(analyser.frequencyBinCount);
-    analyser.getByteFrequencyData(data);
-    const avg = data.reduce((a, b) => a + b, 0) / data.length;
-    const level = Math.min(100, (avg / 255) * 150);
-    levelBar.style.width = level + '%';
-    levelBar.className = `h-full rounded transition-all duration-75 ${level > 80 ? 'bg-red-500' : level > 50 ? 'bg-yellow-500' : 'bg-green-500'}`;
+    
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(dataArray);
+    
+    const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+    const level = Math.min(100, (avg / 255) * 100 * 1.5);
+    
+    levelBar.style.width = `${level}%`;
+    
+    if (level > 80) {
+      levelBar.className = 'h-full bg-red-500 rounded transition-all duration-75';
+    } else if (level > 50) {
+      levelBar.className = 'h-full bg-yellow-500 rounded transition-all duration-75';
+    } else {
+      levelBar.className = 'h-full bg-green-500 rounded transition-all duration-75';
+    }
+    
     animationId = requestAnimationFrame(updateLevelMeter);
   }
 
   function stopLevelMeter() {
-    if (animationId) cancelAnimationFrame(animationId);
-    animationId = null;
+    if (animationId) {
+      cancelAnimationFrame(animationId);
+      animationId = null;
+    }
     if (levelBar) levelBar.style.width = '0%';
   }
 
+  // Start playback (called after user interaction)
   async function startPlayback() {
-    if (!isSourceBufferValid()) return;
-
+    if (!sourceBuffer?.buffered.length) return;
+    
     try {
-      if (sourceBuffer.buffered.length > 0) {
-        player.currentTime = sourceBuffer.buffered.end(0) - 0.1;
-      }
+      // Jump to live edge
+      player.currentTime = sourceBuffer.buffered.end(0) - 0.1;
       await player.play();
       isPlaying = true;
       statusEl.textContent = 'Live — playing';
       messageEl.textContent = '';
-      listenBtn?.classList.add('hidden');
+      if (listenBtn) listenBtn.classList.add('hidden');
       initAudioAnalyser();
     } catch (e) {
-      messageEl.textContent = 'Click "Start Listening" to play';
+      console.error('Play failed:', e);
+      messageEl.textContent = 'Failed to play. Click the button to try again.';
     }
   }
 
-  function onUserInteraction() {
-    userHasInteracted = true;
-    audioContext?.resume();
-
-    if (isSourceBufferValid() && sourceBuffer.buffered.length > 0) {
-      startPlayback();
-    } else {
-      statusEl.textContent = 'Waiting for audio...';
-    }
-  }
-
+  // WebSocket connection
   async function connect() {
     queue = [];
     isAppending = false;
-    stopLevelMeter();
-
+    
     try {
       await createMediaSource();
-      statusEl.textContent = 'Connected — waiting for audio...';
     } catch (e) {
-      statusEl.textContent = 'Browser not supported';
-      messageEl.textContent = 'Try? Your browser may not support WebM/Opus';
+      statusEl.textContent = 'Error initializing audio';
+      messageEl.textContent = 'Your browser may not support this audio format.';
       return;
     }
 
-    const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/?sid=${sid}&role=listener&t=${token}`;
+    const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/?sid=${encodeURIComponent(sid)}&role=listener&t=${encodeURIComponent(token)}`;
     ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
       reconnectAttempts = 0;
       statusEl.textContent = 'Connected — waiting for audio...';
-      messageEl.textContent = 'Click "Start Listening" when ready';
+      messageEl.textContent = userHasInteracted ? '' : 'Click "Start Listening" when ready';
     };
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') {
         try {
-          const msg = JSON.parse(ev.data);
-          if (msg.type === 'broadcast-started') {
-            statusEl.textContent = userHasInteracted ? 'Live — buffering...' : 'Live — click to listen';
-          }
-          if (msg.type === 'session-ended') {
-            intentionallyClosed = true;
-            statusEl.textContent = 'Broadcast ended';
-            messageEl.textContent = 'The broadcaster has stopped.';
-            listenBtn?.classList.add('hidden');
-            ws.close();
-          }
+          handleJsonMessage(JSON.parse(ev.data));
         } catch (e) {}
         return;
       }
 
-      // CRITICAL: Check validity BEFORE touching sourceBuffer
-      if (!isSourceBufferValid()) {
-        console.warn('Received audio chunk but SourceBuffer is gone — ignoring');
-        return;
-      }
-
-      appendChunk(ev.data);
-
-      if (userHasInteracted && !isPlaying && sourceBuffer?.buffered.length > 0) {
-        startPlayback();
+      if (ev.data instanceof ArrayBuffer) {
+        handleBinaryData(ev.data);
       }
     };
 
     ws.onclose = () => {
       stopLevelMeter();
       isPlaying = false;
-
+      
       if (intentionallyClosed) return;
-
+      
       if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
         reconnectAttempts++;
         statusEl.textContent = `Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`;
-        setTimeout(connect, RECONNECT_DELAY_MS);
+        reconnectTimeout = setTimeout(connect, RECONNECT_DELAY_MS);
       } else {
         statusEl.textContent = 'Disconnected';
-        messageEl.textContent = 'Refresh to try again.';
+        messageEl.textContent = 'Could not reconnect. Refresh to try again.';
       }
     };
 
-    ws.onerror = (e) => console.error('WebSocket error:', e);
+    ws.onerror = (e) => {
+      console.error('WebSocket error:', e);
+    };
   }
 
-  listenBtn?.addEventListener('click', onUserInteraction);
+  function handleJsonMessage(msg) {
+    switch (msg.type) {
+      case 'session-ended':
+        intentionallyClosed = true;
+        statusEl.textContent = 'Broadcast ended';
+        messageEl.textContent = 'The broadcaster has stopped the stream.';
+        if (listenBtn) listenBtn.classList.add('hidden');
+        if (mediaSource?.readyState === 'open') {
+          try { mediaSource.endOfStream(); } catch (e) {}
+        }
+        stopLevelMeter();
+        ws.close();
+        break;
+        
+      case 'broadcast-started':
+        statusEl.textContent = userHasInteracted ? 'Live — buffering...' : 'Live — click to listen';
+        break;
+        
+      case 'ok':
+        console.log('Connected to session:', msg.sessionId);
+        break;
+        
+      case 'init-segment':
+        console.log('Receiving init segment:', msg.size, 'bytes');
+        break;
+    }
+  }
+
+  function handleBinaryData(data) {
+    appendChunk(data);
+    
+    // Auto-play if user has already interacted
+    if (userHasInteracted && !isPlaying && sourceBuffer?.buffered.length) {
+      startPlayback();
+    }
+  }
+
+  // User interaction handler
+  function onUserInteraction() {
+    userHasInteracted = true;
+    
+    // Resume audio context if suspended
+    if (audioContext?.state === 'suspended') {
+      audioContext.resume();
+    }
+    
+    if (sourceBuffer?.buffered.length) {
+      startPlayback();
+    } else {
+      statusEl.textContent = 'Waiting for audio data...';
+      messageEl.textContent = '';
+    }
+  }
+
+  // Event listeners
+  if (listenBtn) {
+    listenBtn.addEventListener('click', onUserInteraction);
+  }
 
   player.addEventListener('play', () => {
+    userHasInteracted = true;
     isPlaying = true;
     statusEl.textContent = 'Live — playing';
-    listenBtn?.classList.add('hidden');
+    messageEl.textContent = '';
+    if (listenBtn) listenBtn.classList.add('hidden');
     initAudioAnalyser();
+    
+    if (audioContext?.state === 'suspended') {
+      audioContext.resume();
+    }
   });
 
-  player.addEventListener('pause', stopLevelMeter);
+  player.addEventListener('pause', () => {
+    isPlaying = false;
+    stopLevelMeter();
+  });
 
   window.addEventListener('beforeunload', () => {
     intentionallyClosed = true;
-    if (ws) ws.close();
+    if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    if (ws?.readyState === WebSocket.OPEN) ws.close();
+    stopLevelMeter();
   });
 
+  // Start connection immediately
   connect();
 })();
