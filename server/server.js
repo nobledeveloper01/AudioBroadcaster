@@ -21,6 +21,9 @@ if (!fs.existsSync(RECORDINGS_DIR)) fs.mkdirSync(RECORDINGS_DIR, { recursive: tr
 const app = express();
 const server = http.createServer(app);
 
+// CRITICAL FIX: Trust proxy (Render, Fly.io, Heroku, etc.)
+app.set('trust proxy', 1); // ← THIS FIXES ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+
 // ------------------- Middleware -------------------
 app.use(
   helmet({
@@ -28,22 +31,26 @@ app.use(
       directives: {
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'", "'unsafe-inline'"],
-        connectSrc: ["'self'", "ws:"],
+        connectSrc: ["'self'", "ws:", "wss:"],
         mediaSrc: ["'self'", "blob:"],
         imgSrc: ["'self'", "data:"],
       },
     },
   })
 );
-
 app.use(compression());
 app.use(express.json({ limit: '1mb' }));
 app.use(cors({ origin: (origin, cb) => cb(null, true), credentials: true }));
 
-const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 300 });
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 app.use('/api/', apiLimiter);
 
-app.use('/', express.static(path.join(__dirname, '..', 'public'), { index: 'index.html' }));
+app.use('/', express.static(path.join(__dirname, '..', 'public')));
 
 // ------------------- Sessions -------------------
 const sessions = new Map();
@@ -69,7 +76,6 @@ app.post('/api/session/create', (req, res) => {
       wsWriteStream: wsStream,
       filePath,
       cleanupTimer: null,
-      // NEW: Store init segment for late-joining listeners
       initSegment: null,
       initSegmentReceived: false,
     };
@@ -84,7 +90,12 @@ app.post('/api/session/create', (req, res) => {
     sessions.set(id, session);
 
     const listenPath = `/listener.html?sid=${encodeURIComponent(id)}&t=${encodeURIComponent(token)}`;
-    res.json({ sessionId: id, token, listenUrl: listenPath, expiresAt: new Date(expireAt).toISOString() });
+    res.json({
+      sessionId: id,
+      token,
+      listenUrl: listenPath,
+      expiresAt: new Date(expireAt).toISOString()
+    });
   } catch (err) {
     console.error('create session error', err);
     res.status(500).json({ error: 'could not create session' });
@@ -106,7 +117,7 @@ app.get('/api/recording/:file', (req, res) => {
   res.download(fp);
 });
 
-// ------------------- WebSocket -------------------
+// ------------------- WebSocket Server -------------------
 const wss = new WebSocketServer({ noServer: true, maxPayload: 10 * 1024 * 1024 });
 
 server.on('upgrade', (req, socket, head) => {
@@ -114,15 +125,17 @@ server.on('upgrade', (req, socket, head) => {
   const sid = url.searchParams.get('sid');
   const role = url.searchParams.get('role');
   const token = url.searchParams.get('t') || null;
+
   if (!sid || !role) return socket.destroy();
 
   const sess = sessions.get(sid);
   if (!sess || !sess.active) return socket.destroy();
-
   if (role === 'listener' && token !== sess.token) return socket.destroy();
   if (role === 'listener' && sess.listeners.size >= MAX_LISTENERS) return socket.destroy();
 
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req, { sid, role }));
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req, { sid, role });
+  });
 });
 
 wss.on('connection', (ws, req, meta) => {
@@ -139,98 +152,75 @@ wss.on('connection', (ws, req, meta) => {
     session.broadcasterSocket = ws;
     console.log(`Broadcaster connected for session ${sid}`);
 
-    // Notify existing listeners
     for (const l of session.listeners) {
-      try { l.send(JSON.stringify({ type: 'broadcast-started', startedAt: Date.now() })); } catch(e) {}
+      try { l.send(JSON.stringify({ type: 'broadcast-started' })); } catch (e) {}
     }
 
-    // Track backpressure state
     let draining = false;
-
-    // Handle drain event - file stream is ready for more data
     session.wsWriteStream.on('drain', () => {
       draining = false;
-      try {
-        ws.send(JSON.stringify({ type: 'drain' }));
-      } catch (e) {}
+      try { ws.send(JSON.stringify({ type: 'drain' })); } catch (e) {}
     });
 
     ws.on('message', (data, isBinary) => {
       if (!isBinary) {
         try {
           const msg = JSON.parse(data.toString());
-          if (msg.type === 'meta') broadcastToListeners(session, JSON.stringify({ type: 'meta', meta: msg.meta }));
-          if (msg.type === 'stop') teardownSession(sid, 'stopped-by-broadcaster');
+          if (msg.type === 'keyframe-ready') {
+            // Optional: future use
+          }
         } catch (e) {}
         return;
       }
 
       const chunk = Buffer.from(data);
 
-      // Cache the first chunk as the init segment
+      // Cache init segment
       if (!session.initSegmentReceived) {
         session.initSegment = chunk;
         session.initSegmentReceived = true;
-        console.log(`Init segment cached for session ${sid} (${chunk.length} bytes)`);
+        console.log(`Init segment cached (${chunk.length} bytes)`);
       }
 
-      // Write to file with backpressure handling
-      try {
-        const ok = session.wsWriteStream.write(chunk);
-        if (!ok && !draining) {
-          draining = true;
-          ws.send(JSON.stringify({ type: 'backpressure' }));
-        }
-      } catch (err) { 
-        console.error('write chunk error', err); 
+      const ok = session.wsWriteStream.write(chunk);
+      if (!ok && !draining) {
+        draining = true;
+        ws.send(JSON.stringify({ type: 'backpressure' }));
       }
 
-      // Broadcast to listeners (don't let file I/O block streaming)
+      // Broadcast to all listeners
       for (const l of session.listeners) {
-        if (l.readyState === l.OPEN) {
-          try {
-            l.send(data, { binary: true }, (err) => { 
-              if (err) { l.terminate(); session.listeners.delete(l); } 
-            });
-          } catch(e) { l.terminate(); session.listeners.delete(l); }
+        if (l.readyState === WebSocket.OPEN) {
+          l.send(data, { binary: true });
         }
       }
     });
 
     ws.on('close', () => teardownSession(sid, 'broadcaster-disconnected'));
-    ws.on('error', (err) => { console.error('broadcaster ws error', err); teardownSession(sid, 'error'); });
+    ws.on('error', () => teardownSession(sid, 'error'));
+  }
 
-  } else if (role === 'listener') {
+  else if (role === 'listener') {
     session.listeners.add(ws);
-    console.log(`Listener connected to ${sid} (total=${session.listeners.size})`);
+    console.log(`Listener joined ${sid} (${session.listeners.size} total)`);
 
-    // Send connection confirmation
-    try { 
-      ws.send(JSON.stringify({ type: 'ok', message: 'connected', sessionId: sid })); 
-    } catch(e) {}
+    ws.send(JSON.stringify({ type: 'ok', sessionId: sid }));
 
-    // Notify broadcaster of listener count
-    notifyListenerCount(session);
-
-    // NEW: Send init segment if we have it (for late-joining listeners)
+    // Send cached init segment to late joiners
     if (session.initSegment) {
       try {
         ws.send(JSON.stringify({ type: 'init-segment', size: session.initSegment.length }));
-        ws.send(session.initSegment, { binary: true }, (err) => {
-          if (err) console.error('Error sending init segment:', err);
-        });
-        console.log(`Sent init segment to late-joining listener in session ${sid}`);
+        ws.send(session.initSegment, { binary: true });
       } catch (e) {
-        console.error('Failed to send init segment:', e);
+        console.error('Failed to send init segment to listener:', e);
       }
     }
 
-    // Notify listener if broadcast is already live
     if (session.broadcasterSocket) {
-      try { 
-        ws.send(JSON.stringify({ type: 'broadcast-started', startedAt: session.createdAt })); 
-      } catch(e) {}
+      ws.send(JSON.stringify({ type: 'broadcast-started' }));
     }
+
+    notifyListenerCount(session);
 
     ws.on('close', () => {
       session.listeners.delete(ws);
@@ -240,62 +230,44 @@ wss.on('connection', (ws, req, meta) => {
       session.listeners.delete(ws);
       notifyListenerCount(session);
     });
-  } else {
-    ws.close();
   }
 });
 
 function notifyListenerCount(session) {
-  if (session.broadcasterSocket && session.broadcasterSocket.readyState === session.broadcasterSocket.OPEN) {
-    try {
-      session.broadcasterSocket.send(JSON.stringify({ 
-        type: 'listener-count', 
-        count: session.listeners.size 
-      }));
-    } catch (e) {}
+  if (session.broadcasterSocket?.readyState === WebSocket.OPEN) {
+    session.broadcasterSocket.send(JSON.stringify({
+      type: 'listener-count',
+      count: session.listeners.size
+    }));
   }
 }
 
-function broadcastToListeners(session, msg) {
-  for (const l of session.listeners) {
-    if (l.readyState === l.OPEN) {
-      try { l.send(msg); } catch(e) {}
-    }
-  }
-}
-
-function teardownSession(id, reason='stopped') {
+function teardownSession(id, reason = 'stopped') {
   const session = sessions.get(id);
   if (!session) return;
+
   console.log(`Tearing down session ${id}: ${reason}`);
-
   session.active = false;
-  if (session.cleanupTimer) { clearTimeout(session.cleanupTimer); session.cleanupTimer = null; }
 
-  if (session.broadcasterSocket) { 
-    try { session.broadcasterSocket.close(); } catch(e) {} 
-    session.broadcasterSocket = null; 
-  }
-
+  if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+  if (session.broadcasterSocket) session.broadcasterSocket.close();
   for (const l of session.listeners) {
-    try { 
-      l.send(JSON.stringify({ type: 'session-ended', reason })); 
-      l.close(); 
-    } catch(e) { 
-      try { l.terminate(); } catch(er) {} 
-    }
+    try { l.send(JSON.stringify({ type: 'session-ended', reason })); } catch (e) {}
+    l.close();
   }
   session.listeners.clear();
 
-  // Clear init segment
-  session.initSegment = null;
-
   if (session.wsWriteStream) {
-    session.wsWriteStream.end(() => console.log(`Recording finalized: ${session.filePath}`));
+    session.wsWriteStream.end(() => {
+      console.log(`Recording saved: ${session.filePath}`);
+    });
   }
+
   sessions.delete(id);
 }
 
+// ------------------- Start Server -------------------
 server.listen(PORT, () => {
-  console.log(`Live-audio server running on http://${HOSTNAME}:${PORT} (NODE_ENV=${process.env.NODE_ENV || 'development'})`);
+  console.log(`Live audio server running on http://${HOSTNAME}:${PORT}`);
+  console.log(`Recordings saved to: ${RECORDINGS_DIR}`);
 });
